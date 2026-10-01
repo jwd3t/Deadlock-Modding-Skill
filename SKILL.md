@@ -231,7 +231,121 @@ def build_vpk(file_dict: dict[str, bytes], output_path: str):
 
 ---
 
-## 8. Reverse Engineering `particles.dll` (Assembly & Binary Forensics)
+## 8. C# Asset Pipeline (`ValveResourceFormat`, `ValvePak` & `BCnEncoder.NET`)
+
+While standalone Python scripts are ideal for packaging VPKs, **C# (.NET) is the gold standard for asset manipulation in Source 2**. The `ValveResourceFormat` (VRF) ecosystem provides complete programmatic control over binary KeyValues 3 (KV3), particle system ASTs, and resource serialization without requiring Valve's proprietary compiler tools.
+
+### A. Recommended `.csproj` Dependencies
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Source 2 Resource Decompiler & Serializer -->
+    <PackageReference Include="ValveResourceFormat" Version="10.0.0-*" />
+    <!-- VPK Archive Parser -->
+    <PackageReference Include="ValvePak" Version="0.4.0-*" />
+    <!-- Hardware BC3 / DXT5 Texture Compression -->
+    <PackageReference Include="BCnEncoder.Net" Version="2.1.0" />
+    <!-- Image Decoding & Resizing -->
+    <PackageReference Include="SkiaSharp" Version="2.88.8" />
+  </ItemGroup>
+</Project>
+```
+
+### B. Extracting & Inspecting Game Assets from VPK (`ValvePak`)
+Search and extract compiled files directly from Deadlock's `pak01_dir.vpk`:
+```csharp
+using ValvePak;
+
+var package = new Package();
+package.Read(@"C:\Program Files (x86)\Steam\steamapps\common\Deadlock\game\citadel\pak01_dir.vpk");
+
+// Find entry by internal relative path
+var entry = package.FindEntry("particles/abilities/melee/melee_heavy_activate_charge.vpcf_c");
+if (entry != null) {
+    package.ReadEntry(entry, out var bytes);
+    Console.WriteLine($"Extracted {entry.FileName}.{entry.TypeName}: {bytes.Length} bytes");
+}
+```
+
+### C. Programmatically Modifying and Recompiling Particles (`.vpcf_c`)
+Load a binary `.vpcf_c`, manipulate its operators/initializers AST, apply `KVFlag.Resource`, and serialize back to an engine-ready binary:
+```csharp
+using System.IO;
+using ValveResourceFormat;
+using ValveResourceFormat.ResourceTypes;
+using ValveKeyValue;
+
+// 1. Load compiled resource
+using var res = new Resource();
+using var inStream = new MemoryStream(bytes);
+res.Read(inStream);
+
+// 2. Access the KeyValues 3 ParticleSystem data block
+var ps = (ParticleSystem)res.DataBlock!;
+var data = ps.Data;
+
+// 3. Update external resource references (RERL block)
+var rerl = res.ExternalReferences!;
+rerl.ResourceRefInfoList.Clear();
+rerl.ResourceRefInfoList.Add(new ValveResourceFormat.Blocks.ResourceExtRefList.ResourceReferenceInfo {
+    Id = 0,
+    Name = "materials/particle/custom_sprite.vtex"
+});
+
+// 4. Inject a PreEmission Operator (e.g. anchor CP2 to player head)
+var setPlayerOp = KVObject.Collection(new[] {
+    new KeyValuePair<string, KVObject>("_class", (KVObject)"C_OP_SetControlPointToPlayer"),
+    new KeyValuePair<string, KVObject>("m_nCP1", (KVObject)2),
+    new KeyValuePair<string, KVObject>("m_vecCP1Pos", KVObject.Array(new[] { (KVObject)0.0, (KVObject)0.0, (KVObject)75.0 })),
+    new KeyValuePair<string, KVObject>("m_bOrientToEyes", (KVObject)false)
+});
+data["m_PreEmissionOperators"] = KVObject.Array(new[] { setPlayerOp });
+
+// 5. CRITICAL: Reference textures or child particles with KVFlag.Resource
+var childTexture = (KVObject)"materials/particle/custom_sprite.vtex";
+childTexture.Flag = KVFlag.Resource; // Must set flag 1, otherwise GPU renders error 'X'
+
+// 6. Serialize back to valid binary .vpcf_c
+using var outStream = new MemoryStream();
+res.Serialize(outStream);
+File.WriteAllBytes("output/melee_heavy_activate_charge.vpcf_c", outStream.ToArray());
+```
+
+### D. Compiling Custom Textures (`.vtex_c`) with `BCnEncoder.NET`
+Generate GPU-compliant DXT5/BC3 textures from standard PNGs:
+```csharp
+using BCnEncoder.Encoder;
+using BCnEncoder.Shared;
+using SkiaSharp;
+
+// 1. Decode PNG and resize to power-of-two (e.g. 256x256)
+using var bmp = SKBitmap.Decode("texture.png");
+using var resized = bmp.Resize(new SKImageInfo(256, 256, SKColorType.Rgba8888, SKAlphaType.Unpremul), SKSamplingOptions.Default);
+
+// 2. Hardware BC3 (DXT5) encode
+var encoder = new BcEncoder();
+encoder.OutputOptions.Format = CompressionFormat.Bc3;
+encoder.OutputOptions.GenerateMipMaps = false;
+encoder.OutputOptions.Quality = CompressionQuality.BestQuality;
+var dxt5Blocks = encoder.EncodeToRawBytes(resized.Bytes, 256, 256, PixelFormat.Rgba32);
+
+// 3. Assemble Source 2 .vtex_c binary (2068-byte header + BC3 data blocks)
+// (Clone the 2068-byte RED2/DATA header from an existing vanilla 256x256 DXT5 texture)
+var finalVtex = new byte[2068 + dxt5Blocks[0].Length];
+Array.Copy(vanillaVtexHeader, 0, finalVtex, 0, 2068);
+Array.Copy(dxt5Blocks[0], 0, finalVtex, 2068, dxt5Blocks[0].Length);
+File.WriteAllBytes("materials/particle/custom_sprite.vtex_c", finalVtex);
+```
+
+---
+
+## 9. Reverse Engineering `particles.dll` (Assembly & Binary Forensics)
 
 During the development and debugging of low-level particle mods (such as proximity-based defensive telegraphs), binary reverse engineering of `game/bin/win64/particles.dll` via Capstone and x86-64 disassemblers revealed critical engine internals, VTable layouts, and a fundamental bug in Valve's culling logic.
 
@@ -320,7 +434,7 @@ During the development and debugging of low-level particle mods (such as proximi
 
 ---
 
-## 9. Troubleshooting Guide (For the Agent)
+## 10. Troubleshooting Guide (For the Agent)
 - **Problem: "X" Error Sprites instead of Texture.**
   - *Check 1*: Is the `.vtex_c` correctly encoded in hardware DXT5 (BC3)? Uncompressed formats will fail.
   - *Check 2*: Does the `.vpcf_c` reference have `KVFlag.Resource` applied to the texture path?

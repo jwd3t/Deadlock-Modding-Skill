@@ -21,6 +21,11 @@ Equips AI coding assistants (Google Antigravity, Claude Code, Cursor, Codex, Ope
     * Proven Self-Immunity formula with `C_OP_DistanceCull` ($80.0$ unit threshold).
     * Dynamic distance cut-off using `C_OP_DistanceToTransform` with `PARTICLE_SET_SCALE_CURRENT_VALUE`.
     * Critical operator execution order to prevent ghost pop-ins.
+  * **C# Asset Pipeline (`ValveResourceFormat`, `ValvePak`, `BCnEncoder.NET`)**:
+    * Programmatic `.csproj` setup for decompilation and serialization.
+    * Mining assets directly from `pak01_dir.vpk` in memory with `ValvePak`.
+    * Modifying Source 2 Particle KeyValues 3 ASTs (`m_Initializers`, `m_Operators`, `m_PreEmissionOperators`) and writing compliant binary `.vpcf_c` with `res.Serialize()`.
+    * Pure C# GPU-compliant DXT5 / BC3 texture assembly from PNGs with `BCnEncoder.NET` and `SkiaSharp`.
   * **Reverse Engineering `particles.dll` (Assembly & Binary Forensics)**:
     * Exact memory layouts, VTables (`0x18044d9d0`, `0x180447368`), and RTTI Complete Object Locators.
     * Full x86-64 assembly listings explaining the engine's inverted AABB bypass at `0x180187e0a`.
