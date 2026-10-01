@@ -231,7 +231,96 @@ def build_vpk(file_dict: dict[str, bytes], output_path: str):
 
 ---
 
-## 🔧 Troubleshooting Guide (For the Agent)
+## 8. Reverse Engineering `particles.dll` (Assembly & Binary Forensics)
+
+During the development and debugging of low-level particle mods (such as proximity-based defensive telegraphs), binary reverse engineering of `game/bin/win64/particles.dll` via Capstone and x86-64 disassemblers revealed critical engine internals, VTable layouts, and a fundamental bug in Valve's culling logic.
+
+### A. `C_OP_DistanceCull::Operate` & The Early-Exit Bug (`0x180187e0a`)
+- **Symbol / VTable**: `C_OP_DistanceCull::Operate` (`0x180187d20 - 0x180188065`), VTable: `0x18044d9d0`, RTTI Complete Object Locator: `0x180494218`.
+- **Class Memory Layout**:
+  - `+0x1d8`: `m_nControlPoint` (`int32`, default: 0)
+  - `+0x1dc`: `m_vecPointOffset` (`Vector3`, 12 bytes)
+  - `+0x1e8`: `m_flDistance` (`CParticleCollectionFloatInput`, 368 bytes, extends to `+0x358`)
+  - `+0x358`: `m_bCullInside` (`bool`, 1 byte)
+  - `+0x35c`: `m_nAttribute` (`int32`, default: 1 = `LifeTime`)
+
+- **Disassembly of the Valve Early-Exit Bug**:
+  ```asm
+  0x180187d20: push    rbp
+  0x180187d22: push    r15
+  0x180187d24: push    r14
+  ...
+  0x180187e05: call    0x1802cb880        ; Calculate particle collection Bounding Box (AABB) dist^2 to CP
+  0x180187e0a: comiss  xmm0, xmm6         ; Compare AABB dist^2 (xmm0) with flDistance^2 (xmm6)
+  0x180187e0e: jbe     0x180187e20        ; If AABB <= flDistance^2, proceed to particle loop
+  0x180187e14: cmp     byte ptr [rbx+0x358], 0 ; Check m_bCullInside flag
+  0x180187e18: ja      0x18018805f        ; <--- BUG! Early return without checking individual particles
+  ...
+  0x18018805f: pop     rbx
+  0x180188060: pop     rbp
+  0x180188061: ret
+  ```
+
+- **Forensic Breakdown of the Failure**:
+  - Valve optimized the operator assuming `m_bCullInside == true` (culling particles *inside* a protective sphere). Under that assumption, if the entire particle bounding box is farther than `flDistance`, no particles can possibly be inside, so returning immediately (`ja 0x18018805f`) skips unnecessary SIMD loops.
+  - **The Flaw**: When a developer sets `m_bCullInside = false` to cull *distant* particles, this early-exit optimization inverts into a catastrophic bypass: if an enemy particle collection is distant (`AABB > flDistance`), the engine aborts the function before checking particles. Consequently, **0 particles are culled**, and distant particles remain permanently rendered.
+  - **Verdict**: `C_OP_DistanceCull` **cannot be used for maximum distance culling** (`m_bCullInside = false`). It can only be used for proximity self-immunity (`m_bCullInside = true`).
+
+---
+
+### B. `CParticleCollectionFloatInput` Evaluation & Deserialization (`0x18005b3a0`)
+- **Evaluation Subroutine**: `0x18005b3a0` (368-byte struct evaluator).
+- **Internal Offsets**:
+  - `+0x14`: `m_nType` (`0 = PF_TYPE_LITERAL`, `1 = PF_TYPE_NAMED_VALUE`, `2 = PF_TYPE_MAP_RANGE`, etc.)
+  - `+0x18`: `m_flLiteralValue` (`float32`, IEEE-754)
+- **KV3 Serialization Quirk**:
+  - If authored as a primitive scalar double in KV3 (`m_flDistance = 80.0`), the Source 2 deserializer correctly populates `m_nType = 0` and `m_flLiteralValue = 80.0f`.
+  - If authored as a verbose nested subtable (`m_flDistance = { m_nType = 0, m_flLiteralValue = 80.0 }`) without exact engine schema type hashes, the dispatcher at `0x18005b50b` fails the type switch, defaulting `m_flDistance` to `0.0`. This causes proximity checks to never trigger.
+
+---
+
+### C. `C_INIT_DistanceCull::Operate` & Emission-Time Purge (`0x180110d90`)
+- **Symbol / VTable**: `C_INIT_DistanceCull::Operate` (`0x180110d90 - 0x180110f24`), VTable: `0x180447368`.
+- **Disassembly of Particle Termination**:
+  ```asm
+  0x180110ed4: comiss  xmm1, xmm0         ; Compare particle distance with flDistance
+  0x180110ed7: jbe     0x180110f13        ; Branch if particle falls within cull condition
+  ...
+  0x180110f13: mov     dword ptr [rcx + rax*4], 0xbf800000 ; LifeTime = -1.0f (IEEE-754 float: -1.0)
+  0x180110f1b: inc     rax
+  0x180110f1e: dec     r8
+  0x180110f21: jnz     0x180110ecc
+  ```
+- **How Source 2 Eliminates Particles**:
+  - Source 2 does not deallocate memory for culled particles on the fly; it writes `-1.0f` (`0xbf800000`) into the particle's `LifeTime` attribute array (`rcx + rax*4`).
+  - During the subsequent operator phase, `C_OP_Decay` checks if `LifeTime <= 0.0f` and invalidates the particle index before the GPU render submission.
+- **Why `C_INIT_DistanceCull` is Insufficient for Dynamic Telegraphs**:
+  - `C_INIT` operators only execute once at emission (frame 0).
+  - If an enemy begins charging an ability 1,000 units away and sprints towards the player, an emission-time cull will permanently kill the particle at birth, preventing the alert from ever appearing when they enter range.
+  - Furthermore, if the particle is anchored to the local player's head (+75Z), `C_INIT` measures distance to the local player, not the enemy attacker.
+
+---
+
+### D. `C_OP_DistanceToTransform::Operate` SIMD Batch Processing (`0x1801cb250`)
+- **Symbol**: `C_OP_DistanceToTransform::Operate` (`0x1801cb250`).
+- **SIMD Vectorization**:
+  - Evaluates distances in batches of 4 particles using vectorized SSE/AVX instructions (`subps`, `mulps`, `sqrtps`, `maxps`, `minps`, `divps`).
+  - Calculates Euclidean distance: $\Delta = \sqrt{(P_x - T_x)^2 + (P_y - T_y)^2 + (P_z - T_z)^2}$.
+  - Maps $\Delta$ from `[m_flInputMin, m_flInputMax]` to `[m_flOutputMin, m_flOutputMax]`.
+- **Mathematical Formula for Alpha / Radius Scaling**:
+  $$\text{Factor} = \text{clamp}\left(\frac{\Delta - \text{InputMin}}{\text{InputMax} - \text{InputMin}}, 0.0, 1.0\right)$$
+  $$\text{Multiplier} = \text{OutputMin} + \text{Factor} \times (\text{OutputMax} - \text{OutputMin})$$
+- **Why Operator Pipeline Placement is Critical**:
+  - `PARTICLE_SET_SCALE_CURRENT_VALUE` (`m_nSetMethod = 3`) performs:
+    $$\text{Attribute}_{\text{final}} = \text{Attribute}_{\text{current}} \times \text{Multiplier}$$
+  - If placed **before** `C_OP_FadeInSimple` or `C_OP_InterpolateRadius`, those subsequent operators blindly overwrite `Attribute`, causing distant enemies to flash a 50ms "ghost" alert before fading.
+  - Placed at the **very end** of `m_Operators`, when $\Delta \ge 512.0$, $\text{Multiplier} = 0.0$, multiplying any accumulated alpha and radius by zero:
+    $$\text{Alpha} = \text{Alpha}_{\text{fade}} \times 0.0 = 0.0$$
+  - This mathematically guarantees zero pop-in and complete visual silence at distance.
+
+---
+
+## 9. Troubleshooting Guide (For the Agent)
 - **Problem: "X" Error Sprites instead of Texture.**
   - *Check 1*: Is the `.vtex_c` correctly encoded in hardware DXT5 (BC3)? Uncompressed formats will fail.
   - *Check 2*: Does the `.vpcf_c` reference have `KVFlag.Resource` applied to the texture path?
@@ -239,8 +328,11 @@ def build_vpk(file_dict: dict[str, bytes], output_path: str):
   - *Check*: Are `C_OP_DistanceToTransform` operators placed after `C_OP_FadeInSimple` and `C_OP_InterpolateRadius`? Animation operators will overwrite alpha if placed after distance filters.
 - **Problem: Warning triggers on the player themselves.**
   - *Check*: Is `C_OP_DistanceCull` set to `m_bCullInside = true` with `m_flDistance = 80.0`? Player head offset (+75.0Z) must fall strictly inside this radius.
+- **Problem: Distant particles never cull despite setting `C_OP_DistanceCull` with `m_bCullInside = false`.**
+  - *Check*: This is caused by the engine early-exit bug in `particles.dll` (`0x180187e18`). Switch to `C_OP_DistanceToTransform` with `m_nSetMethod = PARTICLE_SET_SCALE_CURRENT_VALUE` placed at the end of `m_Operators`.
 - **Problem: Sound cuts off too early.**
   - *Check*: Did you update `vsnd_duration` in `.vsndevts_c`? It must match the true duration of the new audio file.
 - **Problem: No sound plays at all.**
   - *Check*: The LZ4 control block in the `.vsnd_c` is likely corrupted. Recompile via `ValveResourceFormat` (`res.Serialize()`) instead of manually hex-patching random bytes.
+
 

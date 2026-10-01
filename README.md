@@ -21,6 +21,12 @@ Equips AI coding assistants (Google Antigravity, Claude Code, Cursor, Codex, Ope
     * Proven Self-Immunity formula with `C_OP_DistanceCull` ($80.0$ unit threshold).
     * Dynamic distance cut-off using `C_OP_DistanceToTransform` with `PARTICLE_SET_SCALE_CURRENT_VALUE`.
     * Critical operator execution order to prevent ghost pop-ins.
+  * **Reverse Engineering `particles.dll` (Assembly & Binary Forensics)**:
+    * Exact memory layouts, VTables (`0x18044d9d0`, `0x180447368`), and RTTI Complete Object Locators.
+    * Full x86-64 assembly listings explaining the engine's inverted AABB bypass at `0x180187e0a`.
+    * Structural analysis of `CParticleCollectionFloatInput` (368 bytes) at `0x18005b3a0`.
+    * Emission-time termination via IEEE-754 `-1.0f` (`0xbf800000`) in `C_INIT_DistanceCull` (`0x180110f13`).
+    * Vectorized SIMD batch distance evaluation in `C_OP_DistanceToTransform` (`0x1801cb250`).
   * **Defensive Telegraph Architecture**: Step-by-step design for personal alert systems (e.g. Sekiro Perilous Attack indicators).
 * **`scripts/pack_vpk.py`**: Lightweight, standalone Python VPK v1 packager with zero third-party dependencies (no `vpk.exe` or .NET SDK required to pack).
 
