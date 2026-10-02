@@ -45,13 +45,91 @@ When invoked to create or modify a Deadlock mod, **always adhere to these rules*
 
 ## 2. Texture Modding (`.vtex_c`)
 
-### Hardware Compression Requirement
-- **Critical Rule**: Deadlock's `SpriteCard` particle shaders **reject uncompressed RGBA8888** textures. If an uncompressed texture is loaded in a particle system, the GPU sampler fails and displays the engine's fallback error sprite: **a dark red/orange checkerboard "X"**.
-- **Format**: Textures must be compiled as **DXT5 (BC3)** with full color and alpha channel.
-- **Texture Header Layout**:
-  - 2,068-byte header containing `RED2` and `DATA` blocks cloned from a 256x256 DXT5 texture (e.g. `particle_ring_wave_10.vtex_c`).
+### A. Static Textures (`.vtex_c`)
+- **Hardware Compression Requirement**:
+  - **Critical Rule**: Deadlock's `SpriteCard` particle shaders **reject uncompressed RGBA8888** textures. If an uncompressed texture is loaded in a particle system, the GPU sampler fails and displays the engine's fallback error sprite: **a dark red/orange checkerboard "X"**.
+  - **Format**: Textures must be compiled as **DXT5 (BC3)** with full color and alpha channel.
+- **Static Texture Header Layout**:
+  - 2,068-byte header containing `RED2` and `DATA` blocks cloned from a vanilla 256x256 DXT5 texture (e.g. `particle_ring_wave_10.vtex_c`).
   - Block compression: 256x256 DXT5 produces exactly 65,536 bytes of BC3 pixel data.
   - Total file size: 2,068 + 65,536 = 67,604 bytes.
+
+### B. Animated Textures & Spritesheets (`VTexExtraData.SHEET`)
+Source 2 supports animated texture flipbooks (spritesheets) via an embedded metadata block (`VTexExtraData.SHEET`). Because `ValveResourceFormat` throws `NotImplementedException` when calling `Texture.Serialize()`, animated textures **must be constructed at the binary container level**.
+
+#### 1. Binary Container Architecture
+```
+┌────────────────────────────────────────────────────────┐
+│ Header (16 bytes): totalHeaderSize, v12, v1, off8, n=2 │
+├────────────────────────────────────────────────────────┤
+│ Block Table (24 bytes): RED2 entry (12b), DATA entry   │
+├────────────────────────────────────────────────────────┤
+│ RED2 Block: Cloned from vanilla texture                │
+├────────────────────────────────────────────────────────┤
+│ DATA Block: Texture header + ExtraData table + SHEET   │
+├────────────────────────────────────────────────────────┤
+│ Pixel Payload: Raw BC3 / DXT5 byte blocks (e.g. 1MB)   │
+└────────────────────────────────────────────────────────┘
+```
+
+#### 2. DATA Block Header & ExtraData Table Layout
+```
+Offset   Size  Field                  Value / Description
+──────   ────  ─────                  ───────────────────
+0x00     2     Version                1
+0x02     2     Flags                  0
+0x04     16    Reflectivity           Vector4 (e.g. 0.1, 0.01, 0.01, 0.1)
+0x14     2     Width                  Texture width (e.g. 1024)
+0x16     2     Height                 Texture height (e.g. 1024)
+0x18     2     Depth                  1
+0x1A     1     Format                 2 (VTexFormat.DXT5)
+0x1B     1     NumMipLevels           1
+0x1C     4     Picmip0Res             0
+0x20     4     offsetExtraData        8 (Relative offset to table start at 0x28)
+0x24     4     numExtraData           1 (Number of ExtraData entries)
+0x28     4     Entry[0].Type          2 (VTexExtraData.SHEET)
+0x2C     4     Entry[0].Offset        8 (Relative offset to payload at 0x34)
+0x30     4     Entry[0].Size          byteLength of SHEET binary payload
+0x34     N     SHEET Binary Payload   Raw Version 8 SHEET binary
+0x34+N   pad   16-byte alignment pad  \0 bytes to pad DATA block to 16-byte boundary
+```
+
+#### 3. Reverse-Engineered `SHEET` Block Schema (Version 8)
+- `uint version = 8`
+- `uint numSequences = 1`
+- **Per Sequence**:
+  - `uint id = 0`
+  - `bool clamp = true` (Freezes on last frame instead of looping)
+  - `bool alphaCrop = false`, `bool noColor = false`, `bool noAlpha = false`
+  - `int posFramesRel`: Relative offset to frame list.
+  - `uint totalFrames`: Total frame count (e.g. 25).
+  - `float totalTime`: **CRITICAL ENGINE QUIRK** — Set to `(totalFrames - 1).0f` in tick units (`24.0f`), NOT seconds!
+  - `int posNameRel`: Relative offset to UTF-8 sequence name (`"CDmeSheetSequence\0"`).
+  - `int posFloatParamsRel`: Relative offset to float parameters (`uint count = 0`).
+- **Per Frame (`f = 0 ... totalFrames - 1`)**:
+  - `float displayTime`: **CRITICAL ENGINE QUIRK** — Set to `1.0f` for all frames $0 \dots N-2$, and `0.0f` for terminal frame $N-1$.
+  - `int relOffsetToImages`: Relative offset to images descriptor.
+  - `uint numImages = 1`: Exactly 1 image per frame.
+- **Per Image**: 8 consecutive single-precision IEEE-754 floats ($0.0 \dots 1.0$ normalized UV coordinates):
+  - `CroppedMin (minX, minY)`, `CroppedMax (maxX, maxY)`
+  - `UncroppedMin (minX, minY)`, `UncroppedMax (maxX, maxY)`
+
+#### 4. The 850 FPS Failure Mode ("Aparece un milisegundo y desaparece")
+> [!CAUTION]
+> In Source 2's `SHEET` block, `DisplayTime` and `TotalTime` are **measured in sequence tick units**, not floating-point seconds.
+> If a developer writes `DisplayTime = 0.034` (thinking seconds) and sets particle `m_flAnimationRate = 29.0`:
+> The engine evaluates each frame as lasting $0.034 / 29.0 = 0.00117\text{s}$ (1.17 milliseconds).
+> All 25 frames finish playing in **29 milliseconds**, immediately jumping to the transparent last frame.
+> The particle appears as an instantaneous 1-frame flicker.
+> **Fix**: Always write `TotalTime = (numFrames - 1).0f` and `DisplayTime = 1.0f` in the SHEET block.
+
+#### 5. Power-of-Two Grid Layout & DXT5 Block Alignment
+- When packing a $5 \times 5$ (25-frame) grid on a $1024 \times 1024$ canvas:
+  - Cell size: $200 \times 200$ pixels.
+  - Margin: 12 pixels on each edge.
+  - **Block Alignment Rule**: 200 and 12 are exact multiples of 4 (the DXT block dimension). This prevents color bleeding between adjacent animation cells during BC3 block compression.
+  - **Edge Feathering**: Apply a 15-pixel border vignette fade (`alpha * (dist_to_edge / 15.0)`) on extracted frames to guarantee 0 alpha at cell perimeters.
+  - **Billboard Pre-Rotation**: Rotate each frame **90° counter-clockwise** before placing into the atlas to cancel out Source 2 player-billboard roll.
 
 ---
 
@@ -110,6 +188,33 @@ When invoked to create or modify a Deadlock mod, **always adhere to these rules*
   - Drive Radius (`m_nFieldOutput = 3`): `m_flInputMin = 480.0`, `m_flInputMax = 512.0`, `m_flOutputMin = 1.0`, `m_flOutputMax = 0.0` with `m_nSetMethod = PARTICLE_SET_SCALE_CURRENT_VALUE`.
   - Set `m_TransformStart` to `{ m_nControlPoint: 0 }` (the attacker). Beyond 512 units, Alpha and Radius are clamped to 0.0, rendering the particle completely invisible.
   - **CRITICAL OPERATOR ORDER**: Place `C_OP_DistanceToTransform` filters at the **VERY END** of `m_Operators` (after `C_OP_FadeInSimple` and `C_OP_InterpolateRadius`). If animation operators run after distance culling, `C_OP_FadeInSimple` will temporarily force Alpha > 0 during frame 0-3, causing distant particles to flash/pop-in briefly before disappearing.
+
+### F. Animated Flipbook Playback (`C_OP_RenderSprites`)
+
+To animate a spritesheet / flipbook texture in Source 2 particles:
+
+#### Mode 1: Normalized Lifetime Playback (Recommended for Single-Burst Effects)
+Used by official Valve particles (e.g. `impact_concrete_child_base.vpcf`, `impact_generic_burst_2.vpcf`, `aoe_silence_cast_energy.vpcf`):
+```csharp
+var rend = ps.Data["m_Renderers"][0];
+rend["m_bAnimateInFPS"] = (KVObject)false; // Or omit
+rend["m_flAnimationRate"] = (KVObject)1.0;  // 1.0 = exactly 1 full sequence cycle over particle lifetime
+```
+- **How It Operates**: The engine computes $\text{Frame} = \text{round}\left(\frac{\text{Age}}{\text{Lifetime}} \times (N - 1)\right)$.
+- **Advantages**:
+  - Automatically stretches or compresses the 25 frames across the particle's lifetime (`C_INIT_InitFloat` output field 1 = Lifetime).
+  - Guarantees that frame 0 plays at birth and the final fade-out frame plays right before death (`C_OP_Decay`).
+  - 100% immune to framerate drops, server tick rate discrepancies, or timescale variations.
+
+#### Mode 2: Explicit FPS Playback
+Used when particles have indefinite lifetimes or loop continuously (e.g. `flame_thrower_trail_fire.vpcf`):
+```csharp
+var rend = ps.Data["m_Renderers"][0];
+rend["m_bAnimateInFPS"] = (KVObject)true;
+rend["m_flAnimationRate"] = (KVObject)25.0; // Advances 25 frames/ticks per second
+```
+- If particle lifetime is fixed, ensure $\text{Lifetime} = \frac{\text{numFrames} - 1}{\text{flAnimationRate}}$.
+- For looping sequences, set `clamp = false` in the `SHEET` sequence header.
 
 ---
 
@@ -343,6 +448,159 @@ Array.Copy(dxt5Blocks[0], 0, finalVtex, 2068, dxt5Blocks[0].Length);
 File.WriteAllBytes("materials/particle/custom_sprite.vtex_c", finalVtex);
 ```
 
+### E. Complete C# Animated Flipbook Texture Builder (`.vtex_c` + `SHEET`)
+Because `ValveResourceFormat` throws `NotImplementedException` on `Texture.Serialize()`, use this robust binary container builder to compile animated DXT5 spritesheet textures:
+
+```csharp
+using System.IO;
+using System.Text;
+using BCnEncoder.Encoder;
+using BCnEncoder.Shared;
+using ValvePak;
+using ValveResourceFormat;
+using ValveResourceFormat.ResourceTypes;
+
+public static class VTexSheetBuilder {
+    public static byte[] BuildUniformSheet(int cols, int rows, int texWidth, int texHeight, int cellWidth, int cellHeight, int marginX, int marginY) {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        int totalFrames = cols * rows;
+
+        w.Write((uint)8); // Version 8
+        w.Write((uint)1); // 1 sequence
+        w.Write((uint)0); // id = 0
+        w.Write(true);    // clamp = true
+        w.Write(false);   // alphaCrop
+        w.Write(false);   // noColor
+        w.Write(false);   // noAlpha
+
+        // Sequence timing: TotalTime is (totalFrames - 1) in tick units (e.g. 24.0f)
+        long posFramesRel = ms.Position;
+        w.Write((int)0);
+        w.Write((uint)totalFrames);
+        w.Write((float)(totalFrames - 1));
+
+        long posNameRel = ms.Position;
+        w.Write((int)0);
+
+        long posFloatParamsRel = ms.Position;
+        w.Write((int)0);
+        w.Write((uint)0);
+
+        // Sequence name
+        long namePos = ms.Position;
+        w.Write(Encoding.UTF8.GetBytes("CDmeSheetSequence\0"));
+
+        long curPos = ms.Position;
+        ms.Position = posNameRel;
+        w.Write((int)(namePos - posNameRel));
+        ms.Position = curPos;
+
+        curPos = ms.Position;
+        ms.Position = posFloatParamsRel;
+        w.Write((int)(curPos - posFloatParamsRel));
+        ms.Position = curPos;
+
+        long framesDataPos = ms.Position;
+        ms.Position = posFramesRel;
+        w.Write((int)(framesDataPos - posFramesRel));
+        ms.Position = framesDataPos;
+
+        // Frame headers: 1.0f displayTime for frames 0..N-2, 0.0f for last frame
+        long[] frameImgRelPositions = new long[totalFrames];
+        for (int f = 0; f < totalFrames; f++) {
+            float displayTime = (f == totalFrames - 1) ? 0.0f : 1.0f;
+            w.Write((float)displayTime);
+            frameImgRelPositions[f] = ms.Position;
+            w.Write((int)0);
+            w.Write((uint)1); // 1 image
+        }
+
+        // Image UV rects (8 floats per frame)
+        for (int f = 0; f < totalFrames; f++) {
+            long imgDataPos = ms.Position;
+            ms.Position = frameImgRelPositions[f];
+            w.Write((int)(imgDataPos - frameImgRelPositions[f]));
+            ms.Position = imgDataPos;
+
+            int col = f % cols;
+            int row = f / cols;
+            float minX = (float)(marginX + col * cellWidth) / texWidth;
+            float maxX = (float)(marginX + (col + 1) * cellWidth) / texWidth;
+            float minY = (float)(marginY + row * cellHeight) / texHeight;
+            float maxY = (float)(marginY + (row + 1) * cellHeight) / texHeight;
+
+            w.Write(minX); w.Write(minY);
+            w.Write(maxX); w.Write(maxY);
+            w.Write(minX); w.Write(minY);
+            w.Write(maxX); w.Write(maxY);
+        }
+        return ms.ToArray();
+    }
+
+    public static byte[] BuildAnimatedVtex(byte[] rawRgbaPixels, int width, int height, byte[] sheetBytes, byte[] vanillaRed2Bytes) {
+        // 1. Hardware BC3 compression
+        var encoder = new BcEncoder();
+        encoder.OutputOptions.Format = CompressionFormat.Bc3;
+        encoder.OutputOptions.GenerateMipMaps = false;
+        encoder.OutputOptions.Quality = CompressionQuality.BestQuality;
+        var pixelBytes = encoder.EncodeToRawBytes(rawRgbaPixels, width, height, PixelFormat.Rgba32)[0];
+
+        // 2. DATA Block Header with ExtraData Table
+        using var dataMs = new MemoryStream();
+        using var dw = new BinaryWriter(dataMs);
+        dw.Write((ushort)1); // Version
+        dw.Write((ushort)0); // Flags
+        dw.Write(0.1f); dw.Write(0.01f); dw.Write(0.01f); dw.Write(0.1f); // Reflectivity
+        dw.Write((ushort)width); dw.Write((ushort)height);
+        dw.Write((ushort)1); // Depth
+        dw.Write((byte)2);   // Format: DXT5
+        dw.Write((byte)1);   // NumMipLevels: 1
+        dw.Write((uint)0);   // Picmip0Res
+        dw.Write((uint)8);   // offsetExtraData
+        dw.Write((uint)1);   // numExtraData
+        dw.Write((uint)2);   // Type: SHEET
+        dw.Write((uint)8);   // relative offset to payload
+        dw.Write((uint)sheetBytes.Length);
+        dw.Write(sheetBytes);
+        while (dataMs.Position % 16 != 0) dw.Write((byte)0);
+        byte[] dataBlockBytes = dataMs.ToArray();
+
+        // 3. Assemble Container Header + RED2 + DATA + Pixels
+        using var resMs = new MemoryStream();
+        using var rw = new BinaryWriter(resMs);
+        int blockTableOffset = 16;
+        int blockCount = 2;
+        int red2Offset = blockTableOffset + (blockCount * 12);
+        int dataOffset = red2Offset + vanillaRed2Bytes.Length;
+        int dataPad = (16 - (dataOffset % 16)) % 16;
+        dataOffset += dataPad;
+        int pixelOffset = dataOffset + dataBlockBytes.Length;
+
+        rw.Write((uint)pixelOffset); // totalHeaderSize
+        rw.Write((ushort)12);
+        rw.Write((ushort)1);
+        rw.Write((uint)8);
+        rw.Write((uint)2);
+
+        rw.Write(Encoding.ASCII.GetBytes("RED2"));
+        rw.Write((uint)(red2Offset - (16 + 4)));
+        rw.Write((uint)vanillaRed2Bytes.Length);
+
+        rw.Write(Encoding.ASCII.GetBytes("DATA"));
+        rw.Write((uint)(dataOffset - (16 + 12 + 4)));
+        rw.Write((uint)dataBlockBytes.Length);
+
+        rw.Write(vanillaRed2Bytes);
+        for (int p = 0; p < dataPad; p++) rw.Write((byte)0);
+        rw.Write(dataBlockBytes);
+        rw.Write(pixelBytes);
+
+        return resMs.ToArray();
+    }
+}
+```
+
 ---
 
 ## 9. Reverse Engineering `particles.dll` (Assembly & Binary Forensics)
@@ -448,5 +706,9 @@ During the development and debugging of low-level particle mods (such as proximi
   - *Check*: Did you update `vsnd_duration` in `.vsndevts_c`? It must match the true duration of the new audio file.
 - **Problem: No sound plays at all.**
   - *Check*: The LZ4 control block in the `.vsnd_c` is likely corrupted. Recompile via `ValveResourceFormat` (`res.Serialize()`) instead of manually hex-patching random bytes.
+- **Problem: Animated flipbook texture flashes for a millisecond and disappears ("Aparece un milisegundo y desaparece").**
+  - *Check 1*: In `VTexExtraData.SHEET`, ensure `DisplayTime` is set in frame tick units (`1.0f` for all frames $0 \dots N-2$, and `0.0f` for the last frame), and `TotalTime` is `(numFrames - 1).0f` (`24.0f` for 25 frames). If authored with floating-point seconds (e.g. `0.034f`), Source 2 evaluates playback at ~850 FPS, finishing the entire 25-frame sequence in 29 milliseconds and freezing on the transparent last frame.
+  - *Check 2*: In `C_OP_RenderSprites`, switch to normalized lifetime playback: `m_bAnimateInFPS = false` (or omit) and `m_flAnimationRate = 1.0`. This synchronizes flipbook progression directly to particle lifetime (`C_INIT_InitFloat` output field 1 = Lifetime), ensuring smooth, predictable animation at any framerate.
+
 
 

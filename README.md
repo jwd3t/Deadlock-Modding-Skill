@@ -14,8 +14,12 @@ Equips AI coding assistants (Google Antigravity, Claude Code, Cursor, Codex, Ope
 
 * **`SKILL.md`**: The complete reverse-engineering and modding runbook:
   * **Audio Modding (`.vsnd_c` & `.vsndevts_c`)**: 48,000 Hz MPEG frames, LZ4 control block structure, `vsnd_duration` cut-off fix, in-engine decibel gain mixing (`volume_offset_player`, `volume_enemy_targeting_boost`).
-  * **Texture Modding (`.vtex_c`)**: Hardware DXT5 (BC3) compression requirements, GPU sampler fallback rules (avoiding error "X" sprites), UV roll compensation (pre-rotating 90° CCW).
-  * **Particle Systems (`.vpcf_c`)**: `KVFlag.Resource` requirements, preserving vanilla children (`outer`, `bits`, `model`, `tube`) for multi-mod compatibility, screen-facing billboards.
+  * **Texture Modding (`.vtex_c`)**:
+    * Hardware DXT5 (BC3) compression requirements, GPU sampler fallback rules (avoiding error "X" sprites), UV roll compensation (pre-rotating 90° CCW).
+    * **Animated Textures & Spritesheets (`VTexExtraData.SHEET`)**: Binary container assembly (bypassing VRF's serialization limit), Version 8 `SHEET` schema, tick-based `DisplayTime`/`TotalTime` timing rule (avoiding the 850 FPS instant disappearance bug), power-of-two grid layouts, DXT5 block alignment, and alpha border feathering.
+  * **Particle Systems (`.vpcf_c`)**:
+    * `KVFlag.Resource` requirements, preserving vanilla children (`outer`, `bits`, `model`, `tube`) for multi-mod compatibility, screen-facing billboards.
+    * **Flipbook Animation Playback (`C_OP_RenderSprites`)**: Normalized lifetime playback (`m_flAnimationRate = 1.0`) vs explicit FPS rate (`m_bAnimateInFPS`), synchronization with particle lifetime and decay.
   * **Proximity & Distance Culling**:
     * Reverse-engineered disassembly of Valve's early-exit bug in `C_OP_DistanceCull` (`ja 0x18018805f`).
     * Proven Self-Immunity formula with `C_OP_DistanceCull` ($80.0$ unit threshold).
@@ -26,6 +30,7 @@ Equips AI coding assistants (Google Antigravity, Claude Code, Cursor, Codex, Ope
     * Mining assets directly from `pak01_dir.vpk` in memory with `ValvePak`.
     * Modifying Source 2 Particle KeyValues 3 ASTs (`m_Initializers`, `m_Operators`, `m_PreEmissionOperators`) and writing compliant binary `.vpcf_c` with `res.Serialize()`.
     * Pure C# GPU-compliant DXT5 / BC3 texture assembly from PNGs with `BCnEncoder.NET` and `SkiaSharp`.
+    * Complete low-level animated `.vtex_c` flipbook builder with binary container, `RED2`, `DATA` block ExtraData table, and raw `SHEET` block synthesis.
   * **Reverse Engineering `particles.dll` (Assembly & Binary Forensics)**:
     * Exact memory layouts, VTables (`0x18044d9d0`, `0x180447368`), and RTTI Complete Object Locators.
     * Full x86-64 assembly listings explaining the engine's inverted AABB bypass at `0x180187e0a`.
