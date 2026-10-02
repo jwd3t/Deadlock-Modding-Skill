@@ -710,5 +710,105 @@ During the development and debugging of low-level particle mods (such as proximi
   - *Check 1*: In `VTexExtraData.SHEET`, ensure `DisplayTime` is set in frame tick units (`1.0f` for all frames $0 \dots N-2$, and `0.0f` for the last frame), and `TotalTime` is `(numFrames - 1).0f` (`24.0f` for 25 frames). If authored with floating-point seconds (e.g. `0.034f`), Source 2 evaluates playback at ~850 FPS, finishing the entire 25-frame sequence in 29 milliseconds and freezing on the transparent last frame.
   - *Check 2*: In `C_OP_RenderSprites`, switch to normalized lifetime playback: `m_bAnimateInFPS = false` (or omit) and `m_flAnimationRate = 1.0`. This synchronizes flipbook progression directly to particle lifetime (`C_INIT_InitFloat` output field 1 = Lifetime), ensuring smooth, predictable animation at any framerate.
 
+---
 
+## 11. Panorama 2D UI Architecture vs 3D Particles for Screen FX
 
+### A. The 3D Particle Death Screen Anti-Pattern
+- **Why `.vpcf_c` Fails for Full-Screen HUD Displays**:
+  - In Source 2, particles exist in world coordinates tied to entity transforms or ragdoll bones.
+  - When a player dies, the ragdoll collapses, tumbles, or gets obstructed by geometry.
+  - If a death screen (such as Sekiro's "死" Kanji) is implemented via `.vpcf_c` (e.g. `player_death_screen_center.vpcf_c`), the visual symbol is susceptible to camera pitch/yaw rotation, wall clipping, depth-buffer clipping against the floor, and perspective tilt.
+- **The Correct Solution (100% 2D Panorama HUD)**:
+  - Source 2's UI layer (`Panorama`) renders directly to screen space independent of 3D camera geometry and entity transforms.
+  - Target the root death HUD container in `panorama/styles/hud.vcss_c`:
+    ```css
+    #gameplay_hud_dead {
+        width: 100%;
+        height: 100%;
+        visibility: collapse;
+        background-image: url("s2r://panorama/images/hud/sekiro_death_true.vtex");
+        background-size: 800px 450px;
+        background-position: center 36%;
+        background-repeat: no-repeat;
+        opacity: 0.0;
+        sound: "UI.PlayerDeath.Team";
+        transition-property: opacity;
+        transition-duration: 0.3s;
+    }
+    .dead:not(.deathReplayActive) #gameplay_hud_dead {
+        visibility: visible;
+        opacity: 1.0;
+    }
+    ```
+  - This guarantees pixel-perfect screen centering, 100% billboard stability, and zero world clipping.
+
+### B. Channeling & Resurrection Watermarks (Victor / Frank Revive)
+- To implement dynamic watermarks during ability channeling (e.g., Victor's `Shocking Reanimation` displaying the faint grey Sekiro "死" Fake Death watermark):
+  - Target `.ability_element_progress.ability_frank_revive` in `panorama/styles/ability_hud_elements/abilities_frank.vcss_c`.
+  - Set `overflow: noclip;` to prevent the parent container from clipping the large HUD watermark.
+  - Apply CSS keyframe animations for smooth opacity fade-in:
+    ```css
+    @keyframes 'SekiroFakeDeathFadeIn' {
+        0% { opacity: 0.0; pre-transform-scale2d: 0.90; }
+        40% { opacity: 0.65; pre-transform-scale2d: 0.98; }
+        100% { opacity: 0.95; pre-transform-scale2d: 1.0; }
+    }
+    .ability_element_progress.ability_frank_revive #text_container {
+        background-image: url("s2r://panorama/images/hud/sekiro_death_fake.vtex");
+        background-size: 650px 365px;
+        background-position: center bottom;
+        background-repeat: no-repeat;
+        padding-top: 240px;
+        animation-name: SekiroFakeDeathFadeIn;
+        animation-duration: 2.0s;
+        animation-timing-function: ease-in-out;
+    }
+    ```
+
+---
+
+## 12. Full-Spectrum Audio Coverage Matrix (Sandbox & Multi-Channel)
+
+### A. The Sandbox Silent Death Failure Mode
+- In Deadlock, dying in the Sandbox testing room (or against neutral creeps, turrets, and Target Dummies) routes sound through different audio event graphs than normal team deaths:
+  - Match PVP Death: Calls `UI.PlayerDeath.Team` and triggers `Stinger.Death`.
+  - Sandbox / Dummy / Opponent Kill: Calls `UI.PlayerDeath.Opponent` with music stingers suppressed.
+- If a mod only replaces `ui_player_death_team.vsnd_c`, deaths in Sandbox will be completely silent.
+
+### B. Complete 5-Channel Death & Victory Matrix
+To ensure 100% reliable reproduction across all game modes, replace and compile all five audio targets:
+1. `sounds/ui/ui_player_death_opponent.vsnd_c` (Opponent / Dummy / Neutral death)
+2. `sounds/ui/ui_player_death_team.vsnd_c` (Team / Friendly death)
+3. `sounds/music/music_stinger_player_death.vsnd_c` (Music stinger for player defeat)
+4. `sounds/abilities/frank/frank_reanimation_start_01.vsnd_c` (Hero revive start channel)
+5. `sounds/music/music_stinger_game_over_win.vsnd_c` (Shinobi execution / Match victory)
+
+Synchronize durations in `.vsndevts_c` scripts:
+- `soundevents/ui.vsndevts_c`: `UI.PlayerDeath.Team` & `UI.PlayerDeath.Opponent` -> `vsnd_duration = 4.728`, `volume = 5.0`
+- `soundevents/music.vsndevts_c`: `Stinger.Death` -> `vsnd_duration = 4.728`, `volume = 6.0`
+- `soundevents/music.vsndevts_c`: `Stinger.PersonalRejuvinator.Respawn` -> points to `sounds/music/music_stinger_player_death.vsnd` with `vsnd_duration = 4.728`, `volume = 5.0`
+- `soundevents/hero/frank.vsndevts_c`: `Frank.Reanimation.Start` -> `vsnd_duration = 4.728`, `volume = 4.5`
+
+---
+
+## 13. Chest vs Head Anchoring for Combat Stun Indicators
+
+### A. Attachment Driver Mechanics (`aim` vs `head`)
+- When creating target indicators (such as the Sekiro Deathblow Red Dot on parried enemies):
+  - In `melee_parry_debuff.vpcf`, the preview and runtime attachment driver binds CP0 to the model's `"aim"` attachment:
+    ```kv3
+    m_iAttachType = "PATTACH_POINT_FOLLOW"
+    m_attachmentName = "aim"
+    ```
+  - On all Deadlock character models, the `"aim"` attachment represents the torso / center of mass (the crosshair target).
+- **The Stun Star Head Offset Trap**:
+  - Vanilla Deadlock applies `C_OP_SetSingleControlPointPosition` with `m_vecCP1Pos = [0, 0, 70]` to offset the dizzy stun stars over the enemy's head.
+  - To position a Deathblow dot on the chest, zero out this offset (`m_vecCP1Pos = [0, 0, 0]`) and pass the torso position to children via `C_OP_SetChildControlPoints` (`m_nFirstControlPoint = 3`).
+- **Screen-Facing Billboard Configuration**:
+  - In `melee_parry_debuff_symbol.vpcf`, configure the renderer:
+    - `m_nOrientationType = 0` (PARTICLE_ORIENTATION_SCREEN_ALIGNED billboard)
+    - `m_bUseYawWithNormalAligned = false`
+    - `m_nOutputBlendMode = "PARTICLE_OUTPUT_BLEND_MODE_ALPHA"`
+    - Explicit radius initializer (`C_INIT_InitFloat` with `m_nOutputField = 3`, `m_flLiteralValue = 16.0`)
+  - This anchors the crimson deathblow dot firmly to the enemy's chest, facing the player's camera seamlessly regardless of view angle.
